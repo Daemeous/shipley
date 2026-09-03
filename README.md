@@ -19,6 +19,7 @@ Live: **https://daemeous.github.io/shipley/**
 | Stone, Great Wyrley & Penkridge | https://daemeous.github.io/stone/ |
 | Barnsley, Penistone & Stocksbridge | https://daemeous.github.io/barnsley/ |
 | St Helens | https://daemeous.github.io/sthelens/ |
+| Bassetlaw | https://daemeous.github.io/bassetlaw/ |
 
 Related project — **[Pothole Watch](https://github.com/Daemeous/stafford-potholes)**, same visual style, separate Sheet/Apps Script backend.
 
