@@ -41,6 +41,25 @@ const STREET_COL 	 	 	 	= 1; 	 	 	 	 	 	 // A 	 Street
 const WARD_COL 	 	 	 	 	= 4; 	 	 	 	 	 	 // D 	 Ward
 const CHANGELOG_MAX_AGE_DAYS = 30; 	 	 	 // entries older than this get trimmed
 
+// Divides Data into trackable roads (above) and roads with zero residences
+// kept only for route-planner to route through (below) — must match
+// ROUTE_PLANNER_MARKER in build_tracker.py / core.js exactly. Every write
+// path below is bound to getLastTrackableRow() rather than getLastRow(), so
+// a client can never edit Status/partial_geometry on a route-only row even
+// if it somehow sent one. A sheet with no marker row (every deployment
+// built before this existed) behaves exactly as before.
+const ROUTE_PLANNER_MARKER = "###ROUTE_PLANNER_ONLY_BELOW###";
+
+function getLastTrackableRow(sheet) {
+	 const lastRow = sheet.getLastRow();
+	 if (lastRow < 2) return lastRow;
+	 const streetVals = sheet.getRange(2, STREET_COL, lastRow - 1, 1).getValues();
+	 for (let i = 0; i < streetVals.length; i++) {
+	 	 if (streetVals[i][0] === ROUTE_PLANNER_MARKER) return i + 1; // row 2+i is the marker, so i+1 is the last trackable row
+	 }
+	 return lastRow;
+}
+
 // ?? POST handler ??????????????????????????????????????????????????????????????
 function doPost(e) {
 	 try {
@@ -83,7 +102,7 @@ function handleUpdate(body) {
 	 if (isNaN(row) || row < 2) 	 	 return jsonResp({ ok: false, error: "Invalid row index" });
 
 	 const sheet = getDataSheet();
-	 if (row > sheet.getLastRow()) return jsonResp({ ok: false, error: "Row out of range" });
+	 if (row > getLastTrackableRow(sheet)) return jsonResp({ ok: false, error: "Row out of range" });
 	 const prevStatus = sheet.getRange(row, STATUS_COL).getValue();
 
 	 sheet.getRange(row, STATUS_COL).setValue(status);
@@ -105,7 +124,7 @@ function handlePartial(body) {
 	 if (!/^[-|:.\d a-zA-Z]+$/.test(pg)) return jsonResp({ ok: false, error: "Invalid partial geometry format" });
 
 	 const sheet = getDataSheet();
-	 if (row > sheet.getLastRow()) return jsonResp({ ok: false, error: "Row out of range" });
+	 if (row > getLastTrackableRow(sheet)) return jsonResp({ ok: false, error: "Row out of range" });
 	 const prevPg = sheet.getRange(row, PARTIAL_COL).getValue();
 
 	 sheet.getRange(row, PARTIAL_COL).setValue(pg);
@@ -249,7 +268,7 @@ function handlePropose(body) {
   if (isNaN(row) || row < 2) return jsonResp({ ok: false, error: "Invalid row index" });
 
   const dataSheet = getDataSheet();
-  if (row > dataSheet.getLastRow()) return jsonResp({ ok: false, error: "Row out of range" });
+  if (row > getLastTrackableRow(dataSheet)) return jsonResp({ ok: false, error: "Row out of range" });
 
   const pending = getPendingSheet();
   const outstanding = countOutstandingPending(pending, email);
@@ -455,7 +474,18 @@ function logChange(dataSheet, row, field, oldValue, newValue, email, isRevert) {
 }
 
 // Deletes changelog rows older than CHANGELOG_MAX_AGE_DAYS.
-// Runs on every write 	 cheap for a sheet of this size, no separate trigger needed.
+// Runs on every write. Changelog rows are strictly append-order (logChange
+// always appendRow()s), so timestamps are non-decreasing top-to-bottom and
+// every stale row forms a single contiguous block starting at row 2 — binary
+// search for the first row to KEEP, then delete that whole block in ONE
+// deleteRows() call. A previous version read every timestamp with a full
+// column scan and called deleteRow() once per stale row individually; that
+// was fine when the sheet was small but got dramatically slower as months of
+// history built up (each deleteRow() forces a full sheet reflow, and it ran
+// synchronously inside every single status/partial update, so a road update
+// — and anything else queued behind the same spreadsheet lock, including
+// unrelated login/verify calls — could end up waiting on hundreds of
+// individual row deletes). This version is O(log n) reads + O(1) deletes.
 function trimOldChangelogEntries(log) {
 	 const lastRow = log.getLastRow();
 	 if (lastRow < 2) return;
@@ -463,15 +493,13 @@ function trimOldChangelogEntries(log) {
 	 const cutoff = new Date();
 	 cutoff.setDate(cutoff.getDate() - CHANGELOG_MAX_AGE_DAYS);
 
-	 const timestamps = log.getRange(2, 1, lastRow - 1, 1).getValues();
-	 const rowsToDelete = [];
-	 for (let i = 0; i < timestamps.length; i++) {
-	 	 const ts = new Date(timestamps[i][0]);
-	 	 if (ts < cutoff) rowsToDelete.push(i + 2); // +2: 1-indexed, +1 for header row
+	 let lo = 2, hi = lastRow; // binary search for the first row with ts >= cutoff
+	 while (lo < hi) {
+	 	 const mid = Math.floor((lo + hi) / 2);
+	 	 const ts = new Date(log.getRange(mid, 1).getValue());
+	 	 if (ts < cutoff) lo = mid + 1; else hi = mid;
 	 }
-	 // Delete from the bottom up so indices don't shift mid-deletion
-	 rowsToDelete.sort((a, b) => b - a);
-	 rowsToDelete.forEach(r => log.deleteRow(r));
+	 if (lo > 2) log.deleteRows(2, lo - 2);
 }
 
 // ?? Sheet helper ??????????????????????????????????????????????????????????????
@@ -488,7 +516,8 @@ function handleSheetInfo(body) {
     ok: true,
     spreadsheetId: ss.getId(),
     dataGid: dataSheet.getSheetId(),
-    checksumGid: checksumSheet ? checksumSheet.getSheetId() : null
+    checksumGid: checksumSheet ? checksumSheet.getSheetId() : null,
+    lastTrackableRow: getLastTrackableRow(dataSheet)
   });
 }
 
@@ -535,6 +564,15 @@ function countOutstandingPending(pendingSheet, email) {
 }
 
 // ?? Auth helpers ??????????????????????????????????????????????????????????????
+// Every doPost (login AND every single road update/partial/propose/etc.)
+// calls this, and until now EVERY call meant a live network round-trip from
+// Apps Script's servers to Google's OAuth endpoints — the single biggest
+// fixed cost per request, and one a user doing several quick edits in a row
+// paid again and again for the exact same still-valid token. Cache the
+// verified result for a few minutes, keyed by a hash of the token (tokens
+// themselves are far too long for a CacheService key, which caps at 250
+// chars). A cache HIT skips the network call(s) entirely; a MISS falls back
+// to the original verification and populates the cache for next time.
 function getVerifiedEmail(body) {
   if (!GOOGLE_CLIENT_ID) {
     // Fails everyone rather than silently accepting mismatched tokens — but
@@ -542,6 +580,24 @@ function getVerifiedEmail(body) {
     // deployment sees a clear reason instead of a generic "invalid token".
     throw new Error("Server misconfigured: set the GOOGLE_CLIENT_ID script property (Project Settings -> Script Properties) to this deployment's index.html GOOGLE_CLIENT_ID.");
   }
+  const token = body.idToken || body.accessToken;
+  const cache = CacheService.getScriptCache();
+  let cacheKey = null;
+  if (token) {
+    cacheKey = "verauth_" + Utilities.base64EncodeWebSafe(
+      Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, token)
+    );
+    const cached = cache.get(cacheKey);
+    if (cached !== null) return cached === "-" ? null : cached;
+  }
+  const email = verifyEmailUncached(body);
+  // Cache negative results too (short-lived) so a bad/expired token doesn't
+  // keep re-hitting Google on every retry within the same burst.
+  if (cacheKey) cache.put(cacheKey, email || "-", email ? 240 : 30);
+  return email;
+}
+
+function verifyEmailUncached(body) {
   try {
     if (body.idToken) {
       const res = UrlFetchApp.fetch(
@@ -559,21 +615,22 @@ function getVerifiedEmail(body) {
       return info.email.toLowerCase();
     }
     if (body.accessToken) {
+      // Two independent Google calls are needed (tokeninfo to check aud,
+      // userinfo for the email) — fire them together with fetchAll instead
+      // of sequentially, since neither depends on the other's result and
+      // waiting for both one-at-a-time roughly doubled this path's latency.
+      const results = UrlFetchApp.fetchAll([
+        { url: "https://oauth2.googleapis.com/tokeninfo?access_token=" + body.accessToken, muteHttpExceptions: true },
+        { url: "https://www.googleapis.com/oauth2/v3/userinfo", headers: { Authorization: "Bearer " + body.accessToken }, muteHttpExceptions: true }
+      ]);
+      const [tiRes, res] = results;
+      if (tiRes.getResponseCode() !== 200) return null;
+      const tiInfo = JSON.parse(tiRes.getContentText());
       // tokeninfo?access_token= reports which client the token was actually
       // issued to (aud) — check that before trusting userinfo's response,
       // for the same reason as the idToken branch above.
-      const tiRes = UrlFetchApp.fetch(
-        "https://oauth2.googleapis.com/tokeninfo?access_token=" + body.accessToken,
-        { muteHttpExceptions: true }
-      );
-      if (tiRes.getResponseCode() !== 200) return null;
-      const tiInfo = JSON.parse(tiRes.getContentText());
       if (tiInfo.error || tiInfo.aud !== GOOGLE_CLIENT_ID) return null;
 
-      const res = UrlFetchApp.fetch(
-        "https://www.googleapis.com/oauth2/v3/userinfo",
-        { headers: { Authorization: "Bearer " + body.accessToken }, muteHttpExceptions: true }
-      );
       if (res.getResponseCode() !== 200) return null;
       const info = JSON.parse(res.getContentText());
       return info.email ? info.email.toLowerCase() : null;
